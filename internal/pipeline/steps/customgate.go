@@ -3,9 +3,12 @@ package steps
 import (
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
+	"github.com/kunchenguid/no-mistakes/internal/ipc"
 	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
@@ -51,7 +54,7 @@ func (s *CustomGateStep) runFixTurn(sctx *pipeline.StepContext) (string, error) 
 		return "", err
 	}
 
-	requirement := fmt.Sprintf("This gate passes only when the following command exits 0:\n%s", strings.TrimSpace(s.Gate.Command))
+	requirement := fmt.Sprintf("This gate passes only when the following command exits 0 and reports no error findings through NO_MISTAKES_FINDINGS_FILE:\n%s", strings.TrimSpace(s.Gate.Command))
 
 	prompt := fmt.Sprintf(
 		`Fix the violations reported by the repository gate %q.
@@ -95,29 +98,78 @@ Previous gate findings to address:
 
 func (s *CustomGateStep) executeCommand(sctx *pipeline.StepContext, fixSummary string) (*pipeline.StepOutcome, error) {
 	command := strings.TrimSpace(s.Gate.Command)
+	workDir, err := filepath.Abs(sctx.WorkDir)
+	if err == nil {
+		workDir, err = filepath.EvalSymlinks(workDir)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("resolve gate worktree: %w", err)
+	}
+	// A sibling directory stays outside the worktree even when TMPDIR points inside it.
+	dir, err := os.MkdirTemp(filepath.Dir(workDir), ".no-mistakes-gate-")
+	if err != nil {
+		return nil, fmt.Errorf("create gate findings directory: %w", err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "findings.json")
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		return nil, fmt.Errorf("create gate findings file: %w", err)
+	}
+	commandContext := *sctx
+	commandContext.Env = append(append([]string(nil), sctx.Env...), "NO_MISTAKES_FINDINGS_FILE="+path)
 	sctx.Log(fmt.Sprintf("running gate %q: %s", s.Gate.Name, command))
-	output, exitCode, err := runStepShellCommand(sctx, command)
+	output, exitCode, err := runStepShellCommand(&commandContext, command)
 	if err != nil {
 		logConfiguredCommandOutput(sctx, output, s.Name())
 		return nil, fmt.Errorf("run gate %q command: %w", s.Gate.Name, err)
 	}
-	if exitCode == 0 {
+	items, reported, reportErr := readGateFindings(path)
+	if reportErr == nil && !reported && exitCode == 0 {
 		return &pipeline.StepOutcome{FixSummary: fixSummary}, nil
 	}
-
-	projectedOutput := logConfiguredCommandOutput(sctx, output, s.Name())
-	findings := Findings{
-		Items: []Finding{{
-			Severity:    "error",
+	needsApproval := exitCode != 0
+	if reportErr != nil {
+		needsApproval = true
+		items = []Finding{{
+			Severity:    types.FindingSeverityError,
+			Description: fmt.Sprintf("gate %q findings file invalid: %v", s.Gate.Name, reportErr),
+			Action:      types.ActionAskUser,
+		}}
+	} else if !reported {
+		items = []Finding{{
+			Severity:    types.FindingSeverityError,
 			Description: fmt.Sprintf("gate %q failed with exit code %d", s.Gate.Name, exitCode),
 			Action:      types.ActionAskUser,
-		}},
-		Summary: projectedOutput,
+		}}
+	}
+	for _, item := range items {
+		if item.Severity == types.FindingSeverityError {
+			needsApproval = true
+		}
+	}
+	findings := Findings{
+		Items:   items,
+		Summary: logConfiguredCommandOutput(sctx, output, s.Name()),
 		Tested:  []string{command},
 	}
 	findingsJSON, _ := json.Marshal(findings)
+	if reportErr == nil && reported {
+		// Findings ride IPC as a JSON string. Count that escaping too, leaving
+		// half the frame for the event envelope and other run state.
+		encoded, _ := json.Marshal(string(findingsJSON))
+		limit := ipc.MaxFrameBytes / 2
+		if len(encoded) > limit {
+			needsApproval = true
+			findings.Items = []Finding{{
+				Severity:    types.FindingSeverityError,
+				Description: fmt.Sprintf("gate %q report is too large to transport: encoded size %d bytes, limit %d bytes", s.Gate.Name, len(encoded), limit),
+				Action:      types.ActionAskUser,
+			}}
+			findingsJSON, _ = json.Marshal(findings)
+		}
+	}
 	return &pipeline.StepOutcome{
-		NeedsApproval: true,
+		NeedsApproval: needsApproval,
 		// A gate must never repair on the pipeline's own initiative: it states a
 		// repository rule, so deciding that the change should be altered to
 		// satisfy it is the author's call, not the pipeline's. Answering the park
