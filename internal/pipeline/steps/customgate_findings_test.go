@@ -295,6 +295,65 @@ func TestCustomGateStep_TransportBudgetIncludesPersistedFindings(t *testing.T) {
 	}
 }
 
+func TestCustomGateStep_TransportRefusalFitsAfterLargeReviewFinding(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "mock"}, dir, baseSHA, headSHA, config.Commands{})
+
+	reviewResult, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewJSON, err := json.Marshal(Findings{Items: []Finding{{
+		ID:          "review-large",
+		Severity:    types.FindingSeverityInfo,
+		Description: strings.Repeat("r", 600*1024),
+		Action:      types.ActionNoOp,
+	}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := sctx.DB.SetStepFindings(reviewResult.ID, string(reviewJSON)); err != nil {
+		t.Fatal(err)
+	}
+
+	gate := config.Gate{Name: "budget", After: types.StepReview, Command: gateReportCommand(t, dir, 0)}
+	sctx.Config.Gates = []config.Gate{gate}
+	gateResult, err := sctx.DB.InsertStepResult(sctx.Run.ID, gate.StepName())
+	if err != nil {
+		t.Fatal(err)
+	}
+	sctx.StepResultID = gateResult.ID
+	if err := os.WriteFile(filepath.Join(dir, "gate-report.json"), []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	outcome, err := (&CustomGateStep{Gate: gate}).Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var findings Findings
+	if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {
+		t.Fatal(err)
+	}
+	if !outcome.NeedsApproval || len(findings.Items) != 1 || findings.Items[0].Action != types.ActionAskUser || !strings.Contains(findings.Items[0].Description, "too large to transport") {
+		t.Fatalf("transport refusal = %+v", findings)
+	}
+	if err := sctx.DB.SetStepFindings(gateResult.ID, outcome.Findings); err != nil {
+		t.Fatal(err)
+	}
+
+	steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runInfo := &ipc.RunInfo{ID: sctx.Run.ID, RepoID: sctx.Run.RepoID, Branch: sctx.Run.Branch, HeadSHA: sctx.Run.HeadSHA, BaseSHA: sctx.Run.BaseSHA, Status: sctx.Run.Status}
+	for _, step := range steps {
+		runInfo.Steps = append(runInfo.Steps, ipc.StepResultInfo{ID: step.ID, RunID: step.RunID, StepName: step.StepName, StepOrder: step.StepOrder, Status: step.Status, FindingsJSON: step.FindingsJSON})
+	}
+	assertIPCResponseFits(t, &ipc.GetRunResult{Run: runInfo}, true)
+}
+
 func assertIPCResponseFits(t *testing.T, result *ipc.GetRunResult, want bool) {
 	t.Helper()
 	response, err := ipc.NewResponse(1, result)

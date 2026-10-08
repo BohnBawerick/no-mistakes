@@ -179,7 +179,10 @@ func fitGateFindingsTransport(sctx *pipeline.StepContext, findings Findings) (st
 	if err != nil {
 		return "", false, err
 	}
-	limit := remaining - configuredGateCount(sctx)*gateTransportRefusalReserveBytes()
+	// Normal reports keep half the frame for the run envelope. A bounded
+	// refusal can use the remaining frame capacity when earlier steps have
+	// already consumed that report budget.
+	limit := remaining - ipc.MaxFrameBytes/2 - configuredGateCount(sctx)*gateTransportRefusalReserveBytes()
 	if limit < 0 {
 		limit = 0
 	}
@@ -226,7 +229,7 @@ func remainingGateFindingsTransportBytes(sctx *pipeline.StepContext) (int, error
 	if err != nil {
 		return 0, err
 	}
-	remaining := ipc.MaxFrameBytes / 2
+	remaining := ipc.MaxFrameBytes
 	for _, step := range steps {
 		if step.ID == sctx.StepResultID || step.FindingsJSON == nil {
 			continue
