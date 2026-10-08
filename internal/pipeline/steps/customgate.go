@@ -152,24 +152,12 @@ func (s *CustomGateStep) executeCommand(sctx *pipeline.StepContext, fixSummary s
 		Summary: logConfiguredCommandOutput(sctx, output, s.Name()),
 		Tested:  []string{command},
 	}
-	findingsJSON, _ := json.Marshal(findings)
-	if reportErr == nil && reported {
-		limit, err := remainingGateFindingsTransportBytes(sctx)
-		if err != nil {
-			return nil, fmt.Errorf("measure gate findings transport budget: %w", err)
-		}
-		// Findings ride IPC as JSON strings. Count that escaping and the run's
-		// other persisted findings, leaving half the frame for other run state.
-		encoded, _ := json.Marshal(string(findingsJSON))
-		if len(encoded) > limit {
-			needsApproval = true
-			findings.Items = []Finding{{
-				Severity:    types.FindingSeverityError,
-				Description: fmt.Sprintf("gate %q report is too large to transport: encoded size %d bytes, limit %d bytes", s.Gate.Name, len(encoded), limit),
-				Action:      types.ActionAskUser,
-			}}
-			findingsJSON, _ = json.Marshal(findings)
-		}
+	findingsJSON, refused, err := fitGateFindingsTransport(sctx, findings)
+	if err != nil {
+		return nil, fmt.Errorf("fit gate findings transport: %w", err)
+	}
+	if refused {
+		needsApproval = true
 	}
 	return &pipeline.StepOutcome{
 		NeedsApproval: needsApproval,
@@ -180,10 +168,57 @@ func (s *CustomGateStep) executeCommand(sctx *pipeline.StepContext, fixSummary s
 		// non-auto-fixable is about who decides, not about whether a repair is
 		// possible.
 		AutoFixable: false,
-		Findings:    string(findingsJSON),
+		Findings:    findingsJSON,
 		ExitCode:    exitCode,
 		FixSummary:  fixSummary,
 	}, nil
+}
+
+func fitGateFindingsTransport(sctx *pipeline.StepContext, findings Findings) (string, bool, error) {
+	remaining, err := remainingGateFindingsTransportBytes(sctx)
+	if err != nil {
+		return "", false, err
+	}
+	limit := remaining - configuredGateCount(sctx)*gateTransportRefusalReserveBytes()
+	if limit < 0 {
+		limit = 0
+	}
+	findingsJSON, encodedSize := encodeGateFindings(findings)
+	if encodedSize <= limit {
+		return findingsJSON, false, nil
+	}
+	refusalJSON, refusalSize := encodeGateFindings(gateTransportRefusal(encodedSize, limit))
+	if refusalSize > remaining {
+		return "", false, fmt.Errorf("transport refusal needs %d bytes, only %d bytes remain", refusalSize, remaining)
+	}
+	return refusalJSON, true, nil
+}
+
+func gateTransportRefusal(encodedSize, limit int) Findings {
+	return Findings{Items: []Finding{{
+		Severity:    types.FindingSeverityError,
+		Description: fmt.Sprintf("gate findings payload is too large to transport: encoded size %d bytes, limit %d bytes", encodedSize, limit),
+		Action:      types.ActionAskUser,
+	}}}
+}
+
+func gateTransportRefusalReserveBytes() int {
+	maxInt := int(^uint(0) >> 1)
+	_, size := encodeGateFindings(gateTransportRefusal(maxInt, maxInt))
+	return size
+}
+
+func configuredGateCount(sctx *pipeline.StepContext) int {
+	if sctx.Config != nil && len(sctx.Config.Gates) > 0 {
+		return len(sctx.Config.Gates)
+	}
+	return 1
+}
+
+func encodeGateFindings(findings Findings) (string, int) {
+	raw, _ := json.Marshal(findings)
+	encoded, _ := json.Marshal(string(raw))
+	return string(raw), len(encoded)
 }
 
 func remainingGateFindingsTransportBytes(sctx *pipeline.StepContext) (int, error) {

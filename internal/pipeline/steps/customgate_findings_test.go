@@ -12,6 +12,7 @@ import (
 
 	"github.com/kunchenguid/no-mistakes/internal/config"
 	"github.com/kunchenguid/no-mistakes/internal/ipc"
+	"github.com/kunchenguid/no-mistakes/internal/pipeline"
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
@@ -132,6 +133,7 @@ func TestCustomGateStep_InvalidFindingsFailClosed(t *testing.T) {
 		{"duplicate IDs", `{"findings":[{"id":"x","severity":"error","description":"low score"},{"id":" x ","severity":"info","description":"same ID"}]}`, "missing or duplicate id"},
 		{"comma in ID", `{"findings":[{"id":"lint,style","severity":"error","description":"low score"}]}`, "id containing a comma"},
 		{"protected path ID", `{"findings":[{"id":"protected-path-refusal","severity":"error","description":"low score"}]}`, "reserved id"},
+		{"test timeout ID", `{"findings":[{"id":"test-agent-timeout","severity":"error","description":"low score"}]}`, "reserved id"},
 		{"unvalidated work ID", `{"findings":[{"id":"test-agent-unvalidated-work","severity":"error","description":"low score"}]}`, "reserved id"},
 		{"unreadable questions ID", `{"findings":[{"id":"review-questions-unreadable","severity":"error","description":"low score"}]}`, "reserved id"},
 		{"missing severity", `{"findings":[{"id":"x","description":"low score"}]}`, "invalid severity"},
@@ -177,11 +179,9 @@ func TestCustomGateStep_InvalidFindingsFailClosed(t *testing.T) {
 			if len(findings.Items) != 1 || findings.Items[0].Severity != "error" || findings.Items[0].Action != types.ActionAskUser || !strings.Contains(findings.Items[0].Description, tc.problem) {
 				t.Fatalf("findings = %+v, want one parse-problem error", findings)
 			}
-			if !strings.Contains(findings.Summary, "gate output") {
-				t.Fatalf("command output missing: %+v", findings)
-			}
 			if tc.name == "transport expansion" {
-				if len(tc.report) != 200064 || !strings.Contains(findings.Items[0].Description, fmt.Sprintf("limit %d bytes", ipc.MaxFrameBytes/2)) {
+				limit := ipc.MaxFrameBytes/2 - gateTransportRefusalReserveBytes()
+				if len(tc.report) != 200064 || !strings.Contains(findings.Items[0].Description, fmt.Sprintf("limit %d bytes", limit)) || findings.Summary != "" || len(findings.Tested) != 0 {
 					t.Fatalf("transport refusal = %+v", findings)
 				}
 				frame, err := json.Marshal(ipc.Event{Type: ipc.EventStepCompleted, RunID: "run-1", RepoID: "repo-1", Findings: &outcome.Findings})
@@ -193,6 +193,8 @@ func TestCustomGateStep_InvalidFindingsFailClosed(t *testing.T) {
 				if !scanner.Scan() || scanner.Err() != nil {
 					t.Fatalf("refusal frame broke the IPC scanner: %v", scanner.Err())
 				}
+			} else if !strings.Contains(findings.Summary, "gate output") {
+				t.Fatalf("command output missing: %+v", findings)
 			}
 		})
 	}
@@ -202,52 +204,46 @@ func TestCustomGateStep_TransportBudgetIncludesPersistedFindings(t *testing.T) {
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "mock"}, dir, baseSHA, headSHA, config.Commands{})
-
-	firstResult, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepName("gate.test.first"))
-	if err != nil {
-		t.Fatal(err)
+	const refusingGates = 8
+	sctx.Config.Gates = make([]config.Gate, refusingGates+1)
+	for i := range sctx.Config.Gates {
+		sctx.Config.Gates[i] = config.Gate{Name: fmt.Sprintf("budget-%d", i), After: types.StepTest, Command: gateReportCommand(0)}
 	}
-	sctx.StepResultID = firstResult.ID
-	largeDescription := strings.Repeat("x", 523650)
-	if err := os.WriteFile(filepath.Join(dir, "gate-report.json"), []byte(`{"findings":[{"id":"first-large","severity":"info","description":"`+largeDescription+`","action":"no-op"}]}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	firstStep := &CustomGateStep{Gate: config.Gate{Name: "first", After: types.StepTest, Command: gateReportCommand(0)}}
-	firstOutcome, err := firstStep.Execute(sctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if firstOutcome.NeedsApproval {
-		t.Fatalf("first gate was refused before consuming its transport budget: %+v", firstOutcome)
-	}
-	if err := sctx.DB.SetStepFindings(firstResult.ID, firstOutcome.Findings); err != nil {
-		t.Fatal(err)
-	}
-
-	secondResult, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepName("gate.test.second"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	sctx.StepResultID = secondResult.ID
-	if err := os.WriteFile(filepath.Join(dir, "gate-report.json"), []byte(`{"findings":[{"id":"second-large","severity":"info","description":"`+largeDescription+`","action":"no-op"}]}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	secondStep := &CustomGateStep{Gate: config.Gate{Name: "second", After: types.StepTest, Command: gateReportCommand(0)}}
-	secondOutcome, err := secondStep.Execute(sctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var secondFindings Findings
-	if err := json.Unmarshal([]byte(secondOutcome.Findings), &secondFindings); err != nil {
-		t.Fatal(err)
-	}
-	firstEncoded, _ := json.Marshal(firstOutcome.Findings)
-	remaining := ipc.MaxFrameBytes/2 - len(firstEncoded)
-	if !secondOutcome.NeedsApproval || len(secondFindings.Items) != 1 || secondFindings.Items[0].Action != types.ActionAskUser || !strings.Contains(secondFindings.Items[0].Description, fmt.Sprintf("limit %d bytes", remaining)) {
-		t.Fatalf("second gate did not use the remaining run budget: %+v", secondFindings)
-	}
-	if err := sctx.DB.SetStepFindings(secondResult.ID, secondOutcome.Findings); err != nil {
-		t.Fatal(err)
+	descriptionBytes := ipc.MaxFrameBytes/2 - len(sctx.Config.Gates)*gateTransportRefusalReserveBytes() - 1024
+	largeDescription := strings.Repeat("x", descriptionBytes)
+	var firstOutcome *pipeline.StepOutcome
+	var firstResultID string
+	var firstStep *CustomGateStep
+	for i, gate := range sctx.Config.Gates {
+		result, err := sctx.DB.InsertStepResult(sctx.Run.ID, gate.StepName())
+		if err != nil {
+			t.Fatal(err)
+		}
+		sctx.StepResultID = result.ID
+		report := `{"findings":[{"id":"large-` + fmt.Sprint(i) + `","severity":"info","description":"` + largeDescription + `","action":"no-op"}]}`
+		if err := os.WriteFile(filepath.Join(dir, "gate-report.json"), []byte(report), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		step := &CustomGateStep{Gate: gate}
+		outcome, err := step.Execute(sctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var findings Findings
+		if err := json.Unmarshal([]byte(outcome.Findings), &findings); err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			if outcome.NeedsApproval || len(findings.Items) != 1 || findings.Items[0].ID != "large-0" {
+				t.Fatalf("near-full first gate = %+v", findings)
+			}
+			firstOutcome, firstResultID, firstStep = outcome, result.ID, step
+		} else if !outcome.NeedsApproval || len(findings.Items) != 1 || findings.Items[0].Action != types.ActionAskUser || findings.Summary != "" || len(findings.Tested) != 0 || !strings.Contains(findings.Items[0].Description, "too large to transport") {
+			t.Fatalf("refusing gate %d = %+v", i, findings)
+		}
+		if err := sctx.DB.SetStepFindings(result.ID, outcome.Findings); err != nil {
+			t.Fatal(err)
+		}
 	}
 
 	steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
@@ -262,10 +258,12 @@ func TestCustomGateStep_TransportBudgetIncludesPersistedFindings(t *testing.T) {
 
 	hypothetical := *runInfo
 	hypothetical.Steps = append([]ipc.StepResultInfo(nil), runInfo.Steps...)
-	hypothetical.Steps[1].FindingsJSON = &firstOutcome.Findings
+	for i := range hypothetical.Steps {
+		hypothetical.Steps[i].FindingsJSON = &firstOutcome.Findings
+	}
 	assertIPCResponseFits(t, &ipc.GetRunResult{Run: &hypothetical}, false)
 
-	sctx.StepResultID = firstResult.ID
+	sctx.StepResultID = firstResultID
 	if err := os.WriteFile(filepath.Join(dir, "gate-report.json"), []byte(`{"findings":[{"id":"replacement","severity":"info","description":"small replacement","action":"no-op"}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
