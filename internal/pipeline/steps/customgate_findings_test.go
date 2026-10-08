@@ -28,7 +28,9 @@ func gateFindingsReport(count int) string {
 	for i := range items {
 		items[i] = Finding{ID: fmt.Sprintf("finding-%d", i), Severity: "info", Description: "budget checked", Action: types.ActionNoOp}
 	}
-	raw, err := json.Marshal(Findings{Items: items})
+	raw, err := json.Marshal(struct {
+		Items []Finding `json:"findings"`
+	}{Items: items})
 	if err != nil {
 		panic(err)
 	}
@@ -45,7 +47,7 @@ func TestCustomGateStep_StructuredFindings(t *testing.T) {
 		count    int
 	}{
 		{"error on zero exit", `{"findings":[{"id":"budget-low","severity":"error","file":"score.go","line":7,"description":"score below budget","action":"auto-fix"}]}`, 0, true, 1},
-		{"error marked no-op", `{"findings":[{"id":"budget-low","severity":" ERROR ","description":"score below budget","action":"no-op"}]}`, 0, true, 1},
+		{"error marked no-op", `{"findings":[{"id":"budget-low","severity":"error","description":"score below budget","action":"no-op"}]}`, 0, true, 1},
 		{"mixed severities", `{"findings":[{"id":"budget-low","severity":"info","description":"score measured","action":"no-op"},{"id":"budget-error","severity":"error","description":"score below budget"}]}`, 0, true, 2},
 		{"warning on zero exit", `{"findings":[{"id":"budget-low","severity":"warning","description":"score near budget"}]}`, 0, false, 1},
 		{"info on zero exit", `{"findings":[{"id":"budget-low","severity":"info","description":"score near budget","action":"no-op"}]}`, 0, false, 1},
@@ -121,14 +123,26 @@ func TestCustomGateStep_InvalidFindingsFailClosed(t *testing.T) {
 		{"missing array", `{}`, "missing findings array"},
 		{"null array", `{"findings":null}`, "missing findings array"},
 		{"wrong array type", `{"findings":{}}`, "parse findings JSON"},
-		{"legacy items only", `{"items":[]}`, "missing findings array"},
+		{"legacy items only", `{"items":[]}`, "unknown field"},
+		{"unknown report field", `{"findings":[],"summary":"not part of this protocol"}`, "unknown field"},
+		{"unknown finding field", `{"findings":[{"id":"x","severity":"error","description":"low score","source":"user"}]}`, "unknown field"},
+		{"legacy action field", `{"findings":[{"id":"x","severity":"error","description":"low score","requires_human_review":false}]}`, "unknown field"},
 		{"trailing JSON", `{"findings":[]} {}`, "parse findings JSON"},
 		{"missing ID", `{"findings":[{"severity":"error","description":"low score"}]}`, "missing or duplicate id"},
 		{"duplicate IDs", `{"findings":[{"id":"x","severity":"error","description":"low score"},{"id":" x ","severity":"info","description":"same ID"}]}`, "missing or duplicate id"},
+		{"comma in ID", `{"findings":[{"id":"lint,style","severity":"error","description":"low score"}]}`, "id containing a comma"},
+		{"protected path ID", `{"findings":[{"id":"protected-path-refusal","severity":"error","description":"low score"}]}`, "reserved id"},
+		{"unvalidated work ID", `{"findings":[{"id":"test-agent-unvalidated-work","severity":"error","description":"low score"}]}`, "reserved id"},
+		{"unreadable questions ID", `{"findings":[{"id":"review-questions-unreadable","severity":"error","description":"low score"}]}`, "reserved id"},
 		{"missing severity", `{"findings":[{"id":"x","description":"low score"}]}`, "invalid severity"},
 		{"unknown severity", `{"findings":[{"id":"x","severity":"fatal","description":"low score"}]}`, "invalid severity"},
+		{"case-folded severity", `{"findings":[{"id":"x","severity":"Error","description":"low score"}]}`, "invalid severity"},
+		{"padded severity", `{"findings":[{"id":"x","severity":" error ","description":"low score"}]}`, "invalid severity"},
 		{"missing description", `{"findings":[{"id":"x","severity":"error"}]}`, "missing a description"},
 		{"unknown action", `{"findings":[{"id":"x","severity":"error","description":"low score","action":"approve"}]}`, "invalid action"},
+		{"case-folded action", `{"findings":[{"id":"x","severity":"error","description":"low score","action":"Ask-User"}]}`, "invalid action"},
+		{"padded action", `{"findings":[{"id":"x","severity":"error","description":"low score","action":" ask-user "}]}`, "invalid action"},
+		{"null action", `{"findings":[{"id":"x","severity":"error","description":"low score","action":null}]}`, "invalid action"},
 		{"negative line", `{"findings":[{"id":"x","severity":"error","description":"low score","line":-1}]}`, "negative line"},
 		{"over byte cap", strings.Repeat(" ", (1<<20)+1), "exceeds 1 MiB"},
 		{"over count cap", gateFindingsReport(501), "exceeds 500 findings"},
@@ -181,6 +195,108 @@ func TestCustomGateStep_InvalidFindingsFailClosed(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCustomGateStep_TransportBudgetIncludesPersistedFindings(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "mock"}, dir, baseSHA, headSHA, config.Commands{})
+
+	firstResult, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepName("gate.test.first"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sctx.StepResultID = firstResult.ID
+	largeDescription := strings.Repeat("x", 523650)
+	if err := os.WriteFile(filepath.Join(dir, "gate-report.json"), []byte(`{"findings":[{"id":"first-large","severity":"info","description":"`+largeDescription+`","action":"no-op"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	firstStep := &CustomGateStep{Gate: config.Gate{Name: "first", After: types.StepTest, Command: gateReportCommand(0)}}
+	firstOutcome, err := firstStep.Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstOutcome.NeedsApproval {
+		t.Fatalf("first gate was refused before consuming its transport budget: %+v", firstOutcome)
+	}
+	if err := sctx.DB.SetStepFindings(firstResult.ID, firstOutcome.Findings); err != nil {
+		t.Fatal(err)
+	}
+
+	secondResult, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepName("gate.test.second"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sctx.StepResultID = secondResult.ID
+	if err := os.WriteFile(filepath.Join(dir, "gate-report.json"), []byte(`{"findings":[{"id":"second-large","severity":"info","description":"`+largeDescription+`","action":"no-op"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	secondStep := &CustomGateStep{Gate: config.Gate{Name: "second", After: types.StepTest, Command: gateReportCommand(0)}}
+	secondOutcome, err := secondStep.Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var secondFindings Findings
+	if err := json.Unmarshal([]byte(secondOutcome.Findings), &secondFindings); err != nil {
+		t.Fatal(err)
+	}
+	firstEncoded, _ := json.Marshal(firstOutcome.Findings)
+	remaining := ipc.MaxFrameBytes/2 - len(firstEncoded)
+	if !secondOutcome.NeedsApproval || len(secondFindings.Items) != 1 || secondFindings.Items[0].Action != types.ActionAskUser || !strings.Contains(secondFindings.Items[0].Description, fmt.Sprintf("limit %d bytes", remaining)) {
+		t.Fatalf("second gate did not use the remaining run budget: %+v", secondFindings)
+	}
+	if err := sctx.DB.SetStepFindings(secondResult.ID, secondOutcome.Findings); err != nil {
+		t.Fatal(err)
+	}
+
+	steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runInfo := &ipc.RunInfo{ID: sctx.Run.ID, RepoID: sctx.Run.RepoID, Branch: sctx.Run.Branch, HeadSHA: sctx.Run.HeadSHA, BaseSHA: sctx.Run.BaseSHA, Status: sctx.Run.Status}
+	for _, step := range steps {
+		runInfo.Steps = append(runInfo.Steps, ipc.StepResultInfo{ID: step.ID, RunID: step.RunID, StepName: step.StepName, StepOrder: step.StepOrder, Status: step.Status, FindingsJSON: step.FindingsJSON})
+	}
+	assertIPCResponseFits(t, &ipc.GetRunResult{Run: runInfo}, true)
+
+	hypothetical := *runInfo
+	hypothetical.Steps = append([]ipc.StepResultInfo(nil), runInfo.Steps...)
+	hypothetical.Steps[1].FindingsJSON = &firstOutcome.Findings
+	assertIPCResponseFits(t, &ipc.GetRunResult{Run: &hypothetical}, false)
+
+	sctx.StepResultID = firstResult.ID
+	if err := os.WriteFile(filepath.Join(dir, "gate-report.json"), []byte(`{"findings":[{"id":"replacement","severity":"info","description":"small replacement","action":"no-op"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := firstStep.Execute(sctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var replacementFindings Findings
+	if err := json.Unmarshal([]byte(replacement.Findings), &replacementFindings); err != nil {
+		t.Fatal(err)
+	}
+	if replacement.NeedsApproval || len(replacementFindings.Items) != 1 || replacementFindings.Items[0].ID != "replacement" {
+		t.Fatalf("replacement counted its own persisted findings: %+v", replacementFindings)
+	}
+}
+
+func assertIPCResponseFits(t *testing.T, result *ipc.GetRunResult, want bool) {
+	t.Helper()
+	response, err := ipc.NewResponse(1, result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	frame, err := json.Marshal(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(frame) + "\n"))
+	scanner.Buffer(make([]byte, 0, ipc.MaxFrameBytes), ipc.MaxFrameBytes)
+	got := scanner.Scan() && scanner.Err() == nil
+	if got != want {
+		t.Fatalf("IPC response fit = %t, want %t (size %d, limit %d, error %v)", got, want, len(frame), ipc.MaxFrameBytes, scanner.Err())
 	}
 }
 

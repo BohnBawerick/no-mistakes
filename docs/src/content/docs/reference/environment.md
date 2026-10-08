@@ -99,7 +99,7 @@ Absolute path to the empty JSON report file supplied to each repository [gate co
 
 This is a command-child variable, not a daemon setting. no-mistakes creates a fresh file outside the worktree before every gate command and removes it after reading the result. Commands can write `{"findings":[...]}` using the existing finding shape to report stable finding IDs and locations. Commands that leave it empty retain their exit-code-only behavior.
 
-The report is capped at 1 MiB and 500 findings, and its encoded findings payload must fit the gate's budget within the existing IPC frame. JSON escaping can lower the effective file cap. An invalid, over-cap, or untransportable report parks with one `error` finding and action `ask-user`; any reported error parks even when the command exits 0. Warning and info findings retain the executor's usual approval policy. See the [gate contract](/no-mistakes/reference/repo-config/#structured-findings) for the schema and exit/file verdicts.
+The report is capped at 1 MiB and 500 findings, and its encoded findings payload must fit the gate's remaining budget within the existing IPC frame after other persisted findings. JSON escaping can lower the effective file cap. An invalid, over-cap, or untransportable report parks with one `error` finding and action `ask-user`; any reported error parks even when the command exits 0. Warning and info findings retain the executor's usual approval policy. See the [gate contract](/no-mistakes/reference/repo-config/#structured-findings) for the schema and exit/file verdicts.
 
 ## `NO_MISTAKES_BITBUCKET_EMAIL`
 

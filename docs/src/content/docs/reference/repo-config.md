@@ -544,7 +544,7 @@ Before each command execution, including a re-check after a fix, no-mistakes cre
 }
 ```
 
-This uses the existing pipeline finding shape. Each finding needs a non-empty `id`, unique within the file and stable across executions, a `severity` of `error`, `warning`, or `info`, and a non-empty `description`. `file` and `line` are optional; a supplied line cannot be negative. `action` is optional and defaults to `ask-user`; accepted values are `auto-fix`, `ask-user`, and `no-op`.
+This uses the existing pipeline finding shape. Each finding needs a non-empty `id`, unique within the file and stable across executions, a `severity` of `error`, `warning`, or `info`, and a non-empty `description`. IDs cannot contain commas or reuse IDs reserved by the pipeline. `file` and `line` are optional; a supplied line cannot be negative. `action` is optional and defaults to `ask-user`; accepted values are `auto-fix`, `ask-user`, and `no-op`. Enum values use these exact spellings. The report and each finding reject fields outside this schema.
 
 | Command exit | File | Gate verdict |
 |---|---|---|
@@ -554,7 +554,7 @@ This uses the existing pipeline finding shape. Each finding needs a non-empty `i
 | Non-zero | Valid report | Park with the reported findings and command output |
 | Any | Invalid or over-cap report | Park with one `error` finding explaining the problem, action `ask-user` |
 
-A report is limited to 1 MiB and 500 findings. The encoded findings payload, including the command and log summary, must also fit half the existing 1 MiB IPC frame, leaving room for the envelope and other run state. JSON escaping can make the effective file cap lower than 1 MiB. A report that cannot fit parks with one `error` finding naming its encoded size and the transport budget, action `ask-user`; findings are never truncated to make it fit. Malformed JSON, a missing `findings` array, missing required fields, duplicate IDs, invalid severities or actions, and an unreadable or non-regular file also fail closed. An empty array is a valid report; an empty file opts out. The temporary directory is removed after the command is checked.
+A report is limited to 1 MiB and 500 findings. The encoded findings payload, including the command and log summary, must fit the portion of half the existing 1 MiB IPC frame left after the run's persisted findings, leaving the other half for the envelope and other run state. JSON escaping can make the effective file cap lower than 1 MiB. A report that cannot fit parks with one `error` finding naming its encoded size and the remaining transport budget, action `ask-user`; findings are never truncated to make it fit. Malformed JSON, a missing `findings` array, missing required fields, duplicate or unusable IDs, invalid severities or actions, unknown fields, and an unreadable or non-regular file also fail closed. An empty array is a valid report; an empty file opts out. The temporary directory is removed after the command is checked.
 
 Findings remain available in `axi status`, `axi logs`, and the TUI, and their IDs can be selected with `axi respond --action fix --findings <ids>`. Executor approval policy is unchanged: a zero-exit report containing only warnings or info still goes through the same approval rules as other steps. Warnings park, and an omitted action defaults to `ask-user`. A gate never starts an automatic repair, even when a reported finding says `auto-fix`.
 

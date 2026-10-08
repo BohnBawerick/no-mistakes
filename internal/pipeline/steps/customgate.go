@@ -154,10 +154,13 @@ func (s *CustomGateStep) executeCommand(sctx *pipeline.StepContext, fixSummary s
 	}
 	findingsJSON, _ := json.Marshal(findings)
 	if reportErr == nil && reported {
-		// Findings ride IPC as a JSON string. Count that escaping too, leaving
-		// half the frame for the event envelope and other run state.
+		limit, err := remainingGateFindingsTransportBytes(sctx)
+		if err != nil {
+			return nil, fmt.Errorf("measure gate findings transport budget: %w", err)
+		}
+		// Findings ride IPC as JSON strings. Count that escaping and the run's
+		// other persisted findings, leaving half the frame for other run state.
 		encoded, _ := json.Marshal(string(findingsJSON))
-		limit := ipc.MaxFrameBytes / 2
 		if len(encoded) > limit {
 			needsApproval = true
 			findings.Items = []Finding{{
@@ -181,4 +184,23 @@ func (s *CustomGateStep) executeCommand(sctx *pipeline.StepContext, fixSummary s
 		ExitCode:    exitCode,
 		FixSummary:  fixSummary,
 	}, nil
+}
+
+func remainingGateFindingsTransportBytes(sctx *pipeline.StepContext) (int, error) {
+	steps, err := sctx.DB.GetStepsByRun(sctx.Run.ID)
+	if err != nil {
+		return 0, err
+	}
+	remaining := ipc.MaxFrameBytes / 2
+	for _, step := range steps {
+		if step.ID == sctx.StepResultID || step.FindingsJSON == nil {
+			continue
+		}
+		encoded, _ := json.Marshal(*step.FindingsJSON)
+		remaining -= len(encoded)
+		if remaining <= 0 {
+			return 0, nil
+		}
+	}
+	return remaining, nil
 }
