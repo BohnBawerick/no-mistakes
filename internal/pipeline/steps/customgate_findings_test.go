@@ -16,12 +16,27 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
-// The command writes the same protocol bytes a trusted repository check would.
-func gateReportCommand(exitCode int) string {
+func gateTestCommand(t *testing.T, dir, unixCommand, windowsCommand string) string {
+	t.Helper()
 	if runtime.GOOS == "windows" {
-		return fmt.Sprintf(`echo %%NO_MISTAKES_FINDINGS_FILE%%>gate-path.txt & copy /y gate-report.json "%%NO_MISTAKES_FINDINGS_FILE%%" >nul & echo gate output & exit %d`, exitCode)
+		path := filepath.Join(dir, "gate-command.cmd")
+		if err := os.WriteFile(path, []byte("@echo off\r\n"+windowsCommand+"\r\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return "call gate-command.cmd"
 	}
-	return fmt.Sprintf(`printf '%%s' "$NO_MISTAKES_FINDINGS_FILE" > gate-path.txt; cat gate-report.json > "$NO_MISTAKES_FINDINGS_FILE"; echo 'gate output'; exit %d`, exitCode)
+	return unixCommand
+}
+
+// The command writes the same protocol bytes a trusted repository check would.
+func gateReportCommand(t *testing.T, dir string, exitCode int) string {
+	t.Helper()
+	return gateTestCommand(
+		t,
+		dir,
+		fmt.Sprintf(`printf '%%s' "$NO_MISTAKES_FINDINGS_FILE" > gate-path.txt; cat gate-report.json > "$NO_MISTAKES_FINDINGS_FILE"; echo 'gate output'; exit %d`, exitCode),
+		fmt.Sprintf("echo %%NO_MISTAKES_FINDINGS_FILE%%>gate-path.txt\r\ncopy /y gate-report.json \"%%NO_MISTAKES_FINDINGS_FILE%%\" >nul\r\necho gate output\r\nexit /b %d", exitCode),
+	)
 }
 
 func gateFindingsReport(count int) string {
@@ -67,7 +82,7 @@ func TestCustomGateStep_StructuredFindings(t *testing.T) {
 			sctx := newTestContext(t, &mockAgent{name: "mock"}, dir, baseSHA, headSHA, config.Commands{})
 			// A command must receive its own fresh file, not an inherited path.
 			sctx.Env = []string{"NO_MISTAKES_FINDINGS_FILE=do-not-use"}
-			step := &CustomGateStep{Gate: config.Gate{Name: "budget", After: types.StepTest, Command: gateReportCommand(tc.exitCode)}}
+			step := &CustomGateStep{Gate: config.Gate{Name: "budget", After: types.StepTest, Command: gateReportCommand(t, dir, tc.exitCode)}}
 			outcome, err := step.Execute(sctx)
 			if err != nil {
 				t.Fatal(err)
@@ -157,7 +172,7 @@ func TestCustomGateStep_InvalidFindingsFailClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 			sctx := newTestContext(t, &mockAgent{name: "mock"}, dir, baseSHA, headSHA, config.Commands{})
-			step := &CustomGateStep{Gate: config.Gate{Name: "budget", After: types.StepTest, Command: gateReportCommand(0)}}
+			step := &CustomGateStep{Gate: config.Gate{Name: "budget", After: types.StepTest, Command: gateReportCommand(t, dir, 0)}}
 			outcome, err := step.Execute(sctx)
 			if err != nil {
 				t.Fatal(err)
@@ -207,7 +222,7 @@ func TestCustomGateStep_TransportBudgetIncludesPersistedFindings(t *testing.T) {
 	const refusingGates = 8
 	sctx.Config.Gates = make([]config.Gate, refusingGates+1)
 	for i := range sctx.Config.Gates {
-		sctx.Config.Gates[i] = config.Gate{Name: fmt.Sprintf("budget-%d", i), After: types.StepTest, Command: gateReportCommand(0)}
+		sctx.Config.Gates[i] = config.Gate{Name: fmt.Sprintf("budget-%d", i), After: types.StepTest, Command: gateReportCommand(t, dir, 0)}
 	}
 	descriptionBytes := ipc.MaxFrameBytes/2 - len(sctx.Config.Gates)*gateTransportRefusalReserveBytes() - 1024
 	largeDescription := strings.Repeat("x", descriptionBytes)
@@ -305,18 +320,13 @@ func TestCustomGateStep_MissingOrNonRegularFindingsFailClosed(t *testing.T) {
 			t.Parallel()
 			dir, baseSHA, headSHA := setupGitRepo(t)
 			sctx := newTestContext(t, &mockAgent{name: "mock"}, dir, baseSHA, headSHA, config.Commands{})
-			command := `rm "$NO_MISTAKES_FINDINGS_FILE"; `
-			if runtime.GOOS == "windows" {
-				command = `del "%NO_MISTAKES_FINDINGS_FILE%" & `
-			}
+			unixCommand := `rm "$NO_MISTAKES_FINDINGS_FILE"; `
+			windowsCommand := `del "%NO_MISTAKES_FINDINGS_FILE%"` + "\r\n"
 			if directory {
-				if runtime.GOOS == "windows" {
-					command += `mkdir "%NO_MISTAKES_FINDINGS_FILE%" & `
-				} else {
-					command += `mkdir "$NO_MISTAKES_FINDINGS_FILE"; `
-				}
+				unixCommand += `mkdir "$NO_MISTAKES_FINDINGS_FILE"; `
+				windowsCommand += `mkdir "%NO_MISTAKES_FINDINGS_FILE%"` + "\r\n"
 			}
-			command += "exit 0"
+			command := gateTestCommand(t, dir, unixCommand+"exit 0", windowsCommand+"exit /b 0")
 			step := &CustomGateStep{Gate: config.Gate{Name: "budget", After: types.StepTest, Command: command}}
 			outcome, err := step.Execute(sctx)
 			if err != nil {
@@ -340,7 +350,7 @@ func TestCustomGateStep_EachCommandGetsAFreshFile(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "gate-report.json"), []byte(`{"findings":[{"id":"low","severity":"error","description":"low score"}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	step := &CustomGateStep{Gate: config.Gate{Name: "budget", After: types.StepTest, Command: gateReportCommand(0)}}
+	step := &CustomGateStep{Gate: config.Gate{Name: "budget", After: types.StepTest, Command: gateReportCommand(t, dir, 0)}}
 	outcome, err := step.Execute(sctx)
 	if err != nil || !outcome.NeedsApproval {
 		t.Fatalf("first execution = %+v, %v", outcome, err)
