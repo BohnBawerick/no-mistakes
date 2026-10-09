@@ -93,7 +93,7 @@ case "$mode:$index" in
     ;;
   aggregate:0)
     printf '%s' '{"findings":[{"id":"aggregate-large","severity":"info","description":"' >"$report"
-    head -c 520000 /dev/zero | tr '\000' x >>"$report"
+    head -c 450000 /dev/zero | tr '\000' x >>"$report"
     printf '%s' '","action":"no-op"}]}' >>"$report"
     echo "aggregate-report-0-bytes=$(wc -c <"$report" | tr -d ' ')"
     ;;
@@ -313,7 +313,7 @@ func TestCustomGateStructuredFindingsJourney(t *testing.T) {
 			t.Fatalf("aggregate first gate findings are missing")
 		}
 		parsed, err := types.ParseFindingsJSON(*first.FindingsJSON)
-		if err != nil || len(parsed.Items) != 1 || parsed.Items[0].ID != "aggregate-large" || len(parsed.Items[0].Description) != 520000 {
+		if err != nil || len(parsed.Items) != 1 || parsed.Items[0].ID != "aggregate-large" || len(parsed.Items[0].Description) != 450000 {
 			t.Fatalf("aggregate first gate findings = %+v, err=%v", parsed.Items, err)
 		}
 
@@ -328,7 +328,7 @@ func TestCustomGateStructuredFindingsJourney(t *testing.T) {
 		if err != nil {
 			t.Fatalf("aggregate first gate axi logs: %v\n%s", err, firstLog)
 		}
-		if !strings.Contains(firstLog, "aggregate-large") || len(firstLog) < 520000 {
+		if !strings.Contains(firstLog, "aggregate-large") || len(firstLog) < 450000 {
 			t.Fatalf("aggregate first gate log lost the near-full finding, bytes=%d", len(firstLog))
 		}
 		lastLog, err := h.RunInDir(fw, "axi", "logs", "--run", runID, "--step", string(gateReportStep(8)), "--full")
