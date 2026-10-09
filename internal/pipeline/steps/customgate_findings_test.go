@@ -195,7 +195,7 @@ func TestCustomGateStep_InvalidFindingsFailClosed(t *testing.T) {
 				t.Fatalf("findings = %+v, want one parse-problem error", findings)
 			}
 			if tc.name == "transport expansion" {
-				limit := ipc.MaxFrameBytes/2 - gateTransportRefusalReserveBytes()
+				limit := ipc.MaxFrameBytes/2 - gateGetRunEnvelopeReserveBytes - gateTransportRefusalReserveBytes()
 				if len(tc.report) != 200064 || !strings.Contains(findings.Items[0].Description, fmt.Sprintf("limit %d bytes", limit)) || findings.Summary != "" || len(findings.Tested) != 0 {
 					t.Fatalf("transport refusal = %+v", findings)
 				}
@@ -224,7 +224,7 @@ func TestCustomGateStep_TransportBudgetIncludesPersistedFindings(t *testing.T) {
 	for i := range sctx.Config.Gates {
 		sctx.Config.Gates[i] = config.Gate{Name: fmt.Sprintf("budget-%d", i), After: types.StepTest, Command: gateReportCommand(t, dir, 0)}
 	}
-	descriptionBytes := ipc.MaxFrameBytes/2 - len(sctx.Config.Gates)*gateTransportRefusalReserveBytes() - 1024
+	descriptionBytes := ipc.MaxFrameBytes/2 - gateGetRunEnvelopeReserveBytes - len(sctx.Config.Gates)*gateTransportRefusalReserveBytes() - 1024
 	largeDescription := strings.Repeat("x", descriptionBytes)
 	var firstOutcome *pipeline.StepOutcome
 	var firstResultID string
@@ -299,31 +299,51 @@ func TestCustomGateStep_TransportRefusalFitsAfterLargeReviewFinding(t *testing.T
 	t.Parallel()
 	dir, baseSHA, headSHA := setupGitRepo(t)
 	sctx := newTestContextWithDBRecords(t, &mockAgent{name: "mock"}, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Config.Gates = make([]config.Gate, config.MaxGates)
+	for i := range sctx.Config.Gates {
+		sctx.Config.Gates[i] = config.Gate{Name: fmt.Sprintf("budget-%d", i), After: types.StepReview, Command: gateReportCommand(t, dir, 0)}
+	}
 
 	reviewResult, err := sctx.DB.InsertStepResult(sctx.Run.ID, types.StepReview)
 	if err != nil {
 		t.Fatal(err)
 	}
-	reviewJSON, err := json.Marshal(Findings{Items: []Finding{{
-		ID:          "review-large",
-		Severity:    types.FindingSeverityInfo,
-		Description: strings.Repeat("r", 600*1024),
-		Action:      types.ActionNoOp,
-	}}})
-	if err != nil {
-		t.Fatal(err)
+	reviewFindings := Findings{Items: []Finding{{
+		ID:       "review-large",
+		Severity: types.FindingSeverityInfo,
+		Action:   types.ActionNoOp,
+	}}}
+	_, emptySize := encodeGateFindings(reviewFindings)
+	targetSize := ipc.MaxFrameBytes - gateGetRunEnvelopeReserveBytes - configuredGateCount(sctx)*gateTransportRefusalReserveBytes()
+	reviewFindings.Items[0].Description = strings.Repeat("r", targetSize-emptySize)
+	reviewJSON, reviewSize := encodeGateFindings(reviewFindings)
+	if reviewSize != targetSize {
+		t.Fatalf("review transport size = %d, want %d", reviewSize, targetSize)
 	}
-	if err := sctx.DB.SetStepFindings(reviewResult.ID, string(reviewJSON)); err != nil {
+	if err := sctx.DB.SetStepFindings(reviewResult.ID, reviewJSON); err != nil {
 		t.Fatal(err)
 	}
 
-	gate := config.Gate{Name: "budget", After: types.StepReview, Command: gateReportCommand(t, dir, 0)}
-	sctx.Config.Gates = []config.Gate{gate}
-	gateResult, err := sctx.DB.InsertStepResult(sctx.Run.ID, gate.StepName())
-	if err != nil {
-		t.Fatal(err)
+	for _, stepName := range types.AllSteps() {
+		if stepName == types.StepReview {
+			continue
+		}
+		if _, err := sctx.DB.InsertStepResult(sctx.Run.ID, stepName); err != nil {
+			t.Fatal(err)
+		}
 	}
-	sctx.StepResultID = gateResult.ID
+	var gateResultID string
+	for i, configuredGate := range sctx.Config.Gates {
+		gateResult, err := sctx.DB.InsertStepResult(sctx.Run.ID, configuredGate.StepName())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if i == 0 {
+			gateResultID = gateResult.ID
+		}
+	}
+	gate := sctx.Config.Gates[0]
+	sctx.StepResultID = gateResultID
 	if err := os.WriteFile(filepath.Join(dir, "gate-report.json"), []byte("{"), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +359,7 @@ func TestCustomGateStep_TransportRefusalFitsAfterLargeReviewFinding(t *testing.T
 	if !outcome.NeedsApproval || len(findings.Items) != 1 || findings.Items[0].Action != types.ActionAskUser || !strings.Contains(findings.Items[0].Description, "too large to transport") {
 		t.Fatalf("transport refusal = %+v", findings)
 	}
-	if err := sctx.DB.SetStepFindings(gateResult.ID, outcome.Findings); err != nil {
+	if err := sctx.DB.SetStepFindings(gateResultID, outcome.Findings); err != nil {
 		t.Fatal(err)
 	}
 
@@ -351,10 +371,24 @@ func TestCustomGateStep_TransportRefusalFitsAfterLargeReviewFinding(t *testing.T
 	for _, step := range steps {
 		runInfo.Steps = append(runInfo.Steps, ipc.StepResultInfo{ID: step.ID, RunID: step.RunID, StepName: step.StepName, StepOrder: step.StepOrder, Status: step.Status, FindingsJSON: step.FindingsJSON})
 	}
-	assertIPCResponseFits(t, &ipc.GetRunResult{Run: runInfo}, true)
+	frameSize := assertIPCResponseFits(t, &ipc.GetRunResult{Run: runInfo}, true)
+	minimumBoundarySize := ipc.MaxFrameBytes - gateGetRunEnvelopeReserveBytes - configuredGateCount(sctx)*gateTransportRefusalReserveBytes()
+	if frameSize < minimumBoundarySize {
+		t.Fatalf("GetRun boundary frame = %d bytes, want at least %d", frameSize, minimumBoundarySize)
+	}
+	findingsBytes := 0
+	for _, step := range steps {
+		if step.FindingsJSON != nil {
+			encoded, _ := json.Marshal(*step.FindingsJSON)
+			findingsBytes += len(encoded)
+		}
+	}
+	if envelopeSize := frameSize - findingsBytes; envelopeSize >= gateGetRunEnvelopeReserveBytes/4 {
+		t.Fatalf("GetRun envelope = %d bytes, reserve %d lacks fourfold headroom", envelopeSize, gateGetRunEnvelopeReserveBytes)
+	}
 }
 
-func assertIPCResponseFits(t *testing.T, result *ipc.GetRunResult, want bool) {
+func assertIPCResponseFits(t *testing.T, result *ipc.GetRunResult, want bool) int {
 	t.Helper()
 	response, err := ipc.NewResponse(1, result)
 	if err != nil {
@@ -370,6 +404,20 @@ func assertIPCResponseFits(t *testing.T, result *ipc.GetRunResult, want bool) {
 	if got != want {
 		t.Fatalf("IPC response fit = %t, want %t (size %d, limit %d, error %v)", got, want, len(frame), ipc.MaxFrameBytes, scanner.Err())
 	}
+	if got {
+		var decoded ipc.Response
+		if err := json.Unmarshal(scanner.Bytes(), &decoded); err != nil {
+			t.Fatalf("decode IPC response: %v", err)
+		}
+		var decodedResult ipc.GetRunResult
+		if err := json.Unmarshal(decoded.Result, &decodedResult); err != nil {
+			t.Fatalf("decode GetRun result: %v", err)
+		}
+		if decodedResult.Run == nil || result.Run == nil || decodedResult.Run.ID != result.Run.ID {
+			t.Fatalf("decoded GetRun = %+v, want run %q", decodedResult.Run, result.Run.ID)
+		}
+	}
+	return len(frame)
 }
 
 func TestCustomGateStep_MissingOrNonRegularFindingsFailClosed(t *testing.T) {

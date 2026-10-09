@@ -13,6 +13,11 @@ import (
 	"github.com/kunchenguid/no-mistakes/internal/types"
 )
 
+// A GetRun response carrying the maximum 16 configured gates uses well under
+// 16 KiB outside findings_json. Keep four times that measured envelope so new
+// run or step fields cannot make an admitted gate refusal exceed the scanner.
+const gateGetRunEnvelopeReserveBytes = 64 << 10
+
 // CustomGateStep runs one repository-declared extra check immediately after
 // its anchor core step. It can only add a verdict to a run: the executor places
 // it after the anchor and no core step consults it. A failed check parks for an
@@ -229,7 +234,7 @@ func remainingGateFindingsTransportBytes(sctx *pipeline.StepContext) (int, error
 	if err != nil {
 		return 0, err
 	}
-	remaining := ipc.MaxFrameBytes
+	remaining := ipc.MaxFrameBytes - gateGetRunEnvelopeReserveBytes
 	for _, step := range steps {
 		if step.ID == sctx.StepResultID || step.FindingsJSON == nil {
 			continue
